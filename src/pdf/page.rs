@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::{
     ffi::CStr,
     mem::ManuallyDrop,
@@ -61,22 +62,29 @@ impl PdfPage {
                 subtype as i32
             ))
         }
-        .map(|annot| unsafe { PdfAnnotation::from_raw(annot) })
+        .map(|annot| {
+            // SAFETY: `mupdf_pdf_create_annot` returns an owned pointer (refcount = 1)
+            // and `self` (the page) is alive.
+            unsafe { PdfAnnotation::from_raw(annot) }
+        })
     }
 
-    pub fn delete_annotation(&mut self, annot: &PdfAnnotation) -> Result<(), Error> {
+    pub fn delete_annotation(&mut self, annot: PdfAnnotation) -> Result<(), Error> {
         unsafe {
             ffi_try!(mupdf_pdf_delete_annot(
                 context(),
                 self.as_mut_ptr(),
-                annot.inner
+                annot.inner.as_ptr()
             ))
         }
     }
 
-    pub fn annotations(&self) -> AnnotationIter {
+    pub fn annotations(&self) -> AnnotationIter<'_> {
         let next = unsafe { pdf_first_annot(context(), self.as_ptr().cast_mut()) };
-        AnnotationIter { next }
+        AnnotationIter {
+            next: NonNull::new(next),
+            marker: PhantomData,
+        }
     }
 
     pub fn update(&mut self) -> Result<bool, Error> {
@@ -504,21 +512,22 @@ impl DerefMut for PdfPage {
 }
 
 #[derive(Debug)]
-pub struct AnnotationIter {
-    next: *mut pdf_annot,
+pub struct AnnotationIter<'a> {
+    next: Option<NonNull<pdf_annot>>,
+    marker: PhantomData<&'a PdfPage>,
 }
 
-impl Iterator for AnnotationIter {
+impl Iterator for AnnotationIter<'_> {
     type Item = PdfAnnotation;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next.is_null() {
-            return None;
-        }
-        let node = self.next;
+        let node = self.next?.as_ptr();
         unsafe {
-            self.next = pdf_next_annot(context(), node);
-            Some(PdfAnnotation::from_raw(node))
+            self.next = NonNull::new(pdf_next_annot(context(), node));
+            // SAFETY: `node` is a borrowed pointer from the page's annotation
+            // list. The PhantomData borrow guarantees the page outlives this
+            // iterator. The yielded PdfAnnotation holds its own page refcount.
+            Some(PdfAnnotation::from_raw_keep_ref(node))
         }
     }
 }
