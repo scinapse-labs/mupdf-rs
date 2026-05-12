@@ -12,9 +12,26 @@ use mupdf_sys::*;
 
 use crate::{
     context, from_enum, rust_slice_to_ffi_ptr, unsafe_impl_ffi_wrapper, Buffer, Error, FFIWrapper,
-    Image, Matrix, Point, Quad, Rect, WriteMode,
+    Font, Image, Matrix, Point, Quad, Rect, WriteMode,
 };
 use crate::{output::Output, FFIAnalogue};
+
+bitflags! {
+    /// Per-char flags reported by the structured-text extractor.
+    pub struct TextCharFlags: u16 {
+        const STRIKEOUT = FZ_STEXT_STRIKEOUT as _;
+        const UNDERLINE = FZ_STEXT_UNDERLINE as _;
+        const SYNTHETIC = FZ_STEXT_SYNTHETIC as _;
+        /// Real or synthesised ("fake") bold.
+        const BOLD = FZ_STEXT_BOLD as _;
+        const FILLED = FZ_STEXT_FILLED as _;
+        const STROKED = FZ_STEXT_STROKED as _;
+        const CLIPPED = FZ_STEXT_CLIPPED as _;
+        const UNICODE_IS_CID = FZ_STEXT_UNICODE_IS_CID as _;
+        const UNICODE_IS_GID = FZ_STEXT_UNICODE_IS_GID as _;
+        const SYNTHETIC_LARGE = FZ_STEXT_SYNTHETIC_LARGE as _;
+    }
+}
 
 bitflags! {
     /// Options for creating a pixmap and draw device.
@@ -454,6 +471,28 @@ impl TextChar<'_> {
     pub fn quad(&self) -> Quad {
         self.inner.quad.into()
     }
+
+    /// Fill color, packed as `0xAARRGGBB` (sRGB).
+    pub fn argb(&self) -> u32 {
+        self.inner.argb
+    }
+
+    pub fn flags(&self) -> TextCharFlags {
+        TextCharFlags::from_bits_truncate(self.inner.flags)
+    }
+
+    /// Returns `None` if mupdf did not associate a font to the TextChar.
+    /// Bumps the font refcount so the returned [`Font`] can outlive this [`TextChar`].
+    pub fn font(&self) -> Option<Font> {
+        let ptr = self.inner.font;
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            fz_keep_font(context(), ptr);
+            Some(Font::from_raw(ptr))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -556,6 +595,51 @@ mod test {
 
         let hits = text_page.search("Not Found").unwrap();
         assert_eq!(hits.len(), 0);
+    }
+
+    #[test]
+    fn test_text_char_font_and_flags() {
+        use crate::TextCharFlags;
+
+        let doc = test_document!("..", "files/dummy.pdf").unwrap();
+        let page0 = doc.load_page(0).unwrap();
+        let text_page = page0.to_text_page(TextPageFlags::empty()).unwrap();
+
+        let block = text_page.blocks().next().expect("at least one block");
+        let line = block.lines().next().expect("at least one line");
+        let first_char = line.chars().next().expect("at least one char");
+
+        assert_eq!(first_char.char(), Some('D'));
+        assert_eq!(first_char.argb(), 0xff000000);
+        assert!(first_char.flags().contains(TextCharFlags::FILLED));
+
+        let font = first_char.font().expect("char should have a font");
+        assert!(!font.name().is_empty());
+    }
+
+    #[test]
+    fn test_text_char_font_outlives_text_page() {
+        let doc = test_document!("..", "files/dummy.pdf").unwrap();
+        let page0 = doc.load_page(0).unwrap();
+        let text_page = page0.to_text_page(TextPageFlags::empty()).unwrap();
+
+        let (font, expected_name) = {
+            let block = text_page.blocks().next().expect("at least one block");
+            let line = block.lines().next().expect("at least one line");
+            let text_char = line.chars().next().expect("at least one char");
+            let font = text_char.font().expect("char should have a font");
+            let expected_name = font.name().to_owned();
+            (font, expected_name)
+        };
+
+        drop(text_page);
+        drop(page0);
+        drop(doc);
+
+        assert_eq!(font.name(), expected_name);
+        assert!(!font.name().is_empty());
+        let _ = font.is_bold();
+        let _ = font.ascender();
     }
 
     #[test]
